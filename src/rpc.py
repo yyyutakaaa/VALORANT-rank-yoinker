@@ -36,16 +36,12 @@ class Rpc:
         self._min_interval: float = 1.0
         self._last_sent_ts: float = 0.0
         self._backoff: float = 1.0  # 1, 2, 4, ... até 30
-        self._last_loop_state: Optional[str] = None
+        self._last_loop_state: Optional[tuple] = None
         self.start_time: float = time.time()
         self._max_backoff_notice: bool = False
 
         # Base payload
-        self._base_payload: Dict[str, Any] = {
-            "buttons": [
-                {"label": "What's this? 👀", "url": "https://zaykenyon.github.io/VALORANT-rank-yoinker/"}
-            ]
-        }
+        self._base_payload: Dict[str, Any] = {}
         # Cache last payload (for dedupe)
         self._last_sent_payload: Optional[Dict[str, Any]] = None
 
@@ -295,9 +291,15 @@ class Rpc:
         if not session_state:
             return None
 
-        if session_state != self._last_loop_state:
+        # Reset the elapsed timer on a state change, and when queueing starts/stops
+        is_queueing = party_state == "MATCHMAKING"
+        loop_key = (session_state, is_queueing)
+        if loop_key != self._last_loop_state:
             self.start_time = time.time()
-            self._last_loop_state = session_state
+            self._last_loop_state = loop_key
+
+        gamemode = self._gamemode(presence, party_state)
+        rank_image = self._rank_image(data)
 
         if session_state == "INGAME":
             if data.get("agent") in (None, ""):
@@ -309,18 +311,18 @@ class Rpc:
                 agent = agent_name
                 agent_img = agent_name.lower().replace("/", "") if agent_name else None
 
-            gamemode = "Custom Game" if presence.get("provisioningFlow") == "CustomGame" else self.gamemodes.get(presence.get("queueId"))
-
-            ally = presence.get("partyOwnerMatchScoreAllyTeam")
-            enemy = presence.get("partyOwnerMatchScoreEnemyTeam")
-            details = f"{gamemode} // {ally} - {enemy}"
+            score = self._score_text(
+                presence.get("partyOwnerMatchScoreAllyTeam"),
+                presence.get("partyOwnerMatchScoreEnemyTeam"),
+            )
+            details = f"{gamemode} · {score}" if score else gamemode
 
             match_map = (match_map or "").lower()
             mapText = self.map_dict.get(match_map)
             if mapText == "The Range":
                 mapImage = "splash_range_square"
                 details = "in Range"
-                agent_img = str(data.get("rank"))
+                agent_img = rank_image
                 agent = data.get("rank_name")
             else:
                 mi = self.map_dict.get(match_map)
@@ -331,7 +333,7 @@ class Rpc:
                 mapImage = None
 
             return dict(
-                state=f"In a Party ({party_size} of {max_party})",
+                state=self._with_rank(self._party_label(party_size, max_party), data),
                 details=details,
                 large_image=mapImage,
                 large_text=mapText,
@@ -345,34 +347,63 @@ class Rpc:
             image = "game_icon_yellow" if is_idle else "game_icon"
             image_text = "VALORANT - Idle" if is_idle else "VALORANT - Online"
 
-            party_string = "Open Party" if party_access == "OPEN" else "Closed Party"
-
-            gamemode = "Custom Game" if party_state == "CUSTOM_GAME_SETUP" else self.gamemodes.get(presence.get("queueId"))
+            label = self._party_label(party_size, max_party, party_access)
+            details = f"In queue - {gamemode}" if is_queueing else f"Lobby - {gamemode}"
 
             return dict(
-                state=f"{party_string} ({party_size} of {max_party})",
-                details=f" Lobby - {gamemode}",
+                state=self._with_rank(label, data),
+                details=details,
                 large_image=image,
                 large_text=image_text,
-                small_image=str(data.get("rank")),
+                small_image=rank_image,
                 small_text=data.get("rank_name"),
+                start=int(self.start_time),
             )
 
         if session_state == "PREGAME":
-            is_custom = presence.get("provisioningFlow") == "CustomGame" or party_state == "CUSTOM_GAME_SETUP"
-            gamemode = "Custom Game" if is_custom else self.gamemodes.get(presence.get("queueId"))
-
             match_map = (match_map or "").lower()
             mapText = self.map_dict.get(match_map)
             mapImage = f"splash_{mapText}_square".lower() if mapText else None
 
             return dict(
-                state=f"In a Party ({party_size} of {max_party})",
+                state=self._with_rank(self._party_label(party_size, max_party), data),
                 details=f"Agent Select - {gamemode}",
                 large_image=mapImage,
                 large_text=mapText if mapText else None,
-                small_image=str(data.get("rank")),
+                small_image=rank_image,
                 small_text=data.get("rank_name"),
+                start=int(self.start_time),
             )
 
         return None
+
+    def _gamemode(self, presence: Dict[str, Any], party_state: str) -> str:
+        if presence.get("provisioningFlow") == "CustomGame" or party_state == "CUSTOM_GAME_SETUP":
+            return "Custom Game"
+        return self.gamemodes.get(presence.get("queueId")) or "VALORANT"
+
+    @staticmethod
+    def _party_label(size, max_size, access: Optional[str] = None) -> str:
+        if not size or size <= 1:
+            return "Solo"
+        prefix = "Party" if access is None else ("Open Party" if access == "OPEN" else "Closed Party")
+        return f"{prefix} ({size} of {max_size})"
+
+    @staticmethod
+    def _with_rank(label: str, data: Dict[str, Any]) -> str:
+        rank_name = data.get("rank_name")
+        return f"{label} · {rank_name}" if rank_name else label
+
+    @staticmethod
+    def _rank_image(data: Dict[str, Any]) -> Optional[str]:
+        rank = data.get("rank")
+        return None if rank is None else str(rank)
+
+    @staticmethod
+    def _score_text(ally, enemy) -> str:
+        try:
+            a, e = int(ally), int(enemy)
+        except (TypeError, ValueError):
+            return ""
+        status = "Winning" if a > e else "Losing" if a < e else "Tied"
+        return f"{status} {a} - {e}"
